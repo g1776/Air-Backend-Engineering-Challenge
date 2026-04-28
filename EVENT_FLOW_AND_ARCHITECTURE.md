@@ -191,13 +191,13 @@ class WS,EMAILQ,EMAILW,EMAIL delivStyle
 
 ### Processing Layer
 
-| Component                 | Primary Recommendation                                     | Alternatives                                                | Responsibilities                                                            |
-| ------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Batch Aggregation Service | In-process in API (initially)                              | Dedicated ECS service behind internal queue at higher scale | Compute notification type, derive grouping keys, upsert open batches        |
-| Time Watch Service        | In-process in API for create/cancel                        | Dedicated service if rule count grows                       | Create and cancel watch rows                                                |
-| Preference Resolver       | Shared library + read-through cache (ElastiCache optional) | Direct DB reads only                                        | Resolve effective preference for `(channel, notification_type)`             |
-| Batch Finalization Worker | EventBridge Scheduler -> ECS Fargate worker                | EventBridge Scheduler -> Lambda                             | Scan expired batches/watches, close/fire, enqueue notification jobs         |
-| Notification Service      | SQS-triggered ECS worker                                   | Lambda consumer                                             | Re-check preferences, build payloads, write finalized notifications, fanout |
+| Component                 | Primary Recommendation                                     | Alternatives                                                | Responsibilities                                                                                                                                                                                                                                                                                                                             |
+| ------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Batch Aggregation Service | In-process in API (initially)                              | Dedicated ECS service behind internal queue at higher scale | Compute notification type, derive grouping keys, upsert open batches                                                                                                                                                                                                                                                                         |
+| Time Watch Service        | In-process in API for create/cancel                        | Dedicated service if rule count grows                       | Create and cancel watch rows                                                                                                                                                                                                                                                                                                                 |
+| Preference Resolver       | Shared library + read-through cache (ElastiCache optional) | Direct DB reads only                                        | Resolve effective preference for `(channel, notification_type)`. If cached, a preference update must invalidate or bypass the cache entry so that finalization re-checks the latest value — the two-phase preference check (at aggregation and again at finalization) provides a safety net for the window between a cache write and expiry. |
+| Batch Finalization Worker | EventBridge Scheduler -> ECS Fargate worker                | EventBridge Scheduler -> Lambda                             | Scan expired batches/watches, close/fire, enqueue notification jobs                                                                                                                                                                                                                                                                          |
+| Notification Service      | SQS-triggered ECS worker                                   | Lambda consumer                                             | Re-check preferences, build payloads, write finalized notifications, fanout                                                                                                                                                                                                                                                                  |
 
 ### State Layer
 
@@ -211,28 +211,27 @@ class WS,EMAILQ,EMAILW,EMAIL delivStyle
 
 ### Delivery Layer
 
-| Component        | Primary Recommendation             | Alternatives                 | Notes                                                                                          |
-| ---------------- | ---------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
-| Realtime Channel | Socket.io/WebSocket on ECS service | API Gateway WebSocket        | ECS is simpler if API already runs there; API Gateway is stronger for fully decoupled realtime |
-| Email Queue      | Amazon SQS                         | EventBridge bus + SQS target | Buffering, retries, and backpressure                                                           |
-| Email Worker     | SQS-triggered Lambda               | ECS worker                   | Lambda is simplest at lower to moderate steady volume                                          |
-| Email Provider   | Amazon SES                         | SendGrid, Mailgun            | Transactional email delivery                                                                   |
+| Component        | Primary Recommendation             | Alternatives                 | Notes                                                                                                                          |
+| ---------------- | ---------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Realtime Channel | Socket.io/WebSocket on ECS service | API Gateway WebSocket        | ECS is simpler if API already runs there; API Gateway is stronger for fully decoupled realtime                                 |
+| Email Queue      | Amazon SQS                         | EventBridge bus + SQS target | Buffering, retries, and backpressure                                                                                           |
+| Email Worker     | SQS-triggered Lambda               | ECS worker                   | Lambda is simplest at lower to moderate steady volume. Must handle provider rate limits and quota exhaustion — see note below. |
+| Email Provider   | Amazon SES                         | SendGrid, Mailgun            | Transactional email delivery; providers enforce per-second send rates and monthly quotas.                                      |
 
-### Cross-Cutting AWS Services
-
-| Concern                      | Recommended Service                     | Notes                                                                                                                                                                                              |
-| ---------------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Secrets                      | AWS Secrets Manager                     | Store DB credentials and provider API keys; enable automatic rotation                                                                                                                              |
-| Encryption                   | AWS KMS                                 | Encrypt data at rest and key-managed secrets                                                                                                                                                       |
-| Observability                | CloudWatch + X-Ray + structured logs    | Track worker lag, queue depth, fanout errors, and latency percentiles                                                                                                                              |
-| Tracing and metrics shipping | AWS Distro for OpenTelemetry            | Optional for standardized traces/metrics exports                                                                                                                                                   |
-| DLQ handling                 | SQS dead-letter queues                  | Isolate poison notification jobs                                                                                                                                                                   |
-| Failover and backups         | RDS/Aurora automated backups + Multi-AZ | Recovery posture for primary state store                                                                                                                                                           |
-| Queue access control         | SQS resource-based IAM policies         | Notification Service IAM role: `SendMessage` only. Email Worker IAM role: `ReceiveMessage` + `DeleteMessage` + `GetQueueAttributes` only. No other principal may publish to the notification queue |
+> [!NOTE]
+> **Provider rate limits and quota exhaustion**
+>
+> The email worker must be resilient to two distinct provider-side constraints:
+>
+> - **Per-second send rate** — The provider rejects sends that exceed a rate limit (typically a `429` or equivalent). The worker should use exponential backoff with jitter on these responses rather than immediately retrying, which would re-hit the limit. SQS visibility timeout should be set high enough to absorb the backoff window.
+> - **Monthly quota** — Once the quota is exhausted, all sends fail until the quota resets. The worker should detect this condition (distinct error code from a rate limit), stop consuming from the queue, and alert via CloudWatch alarm rather than burning retries into the DLQ. Jobs should remain in the queue so they drain automatically once quota resets.
+>
+> Both failure modes should route to the DLQ only when retries are genuinely exhausted — not on first contact with a provider-side limit. Quota exhaustion in particular should never be retried automatically; it requires operator intervention or quota increase.
 
 ## Operational Considerations
 
-- **Observability** — Track key metrics like batch count, batch age, worker lag, queue depth, delivery failures, and notification volume.
+- **Observability** — Track key metrics like batch count, batch age, worker lag, queue depth, delivery failures, and notification volume. Use SQS dead-letter queues to isolate poison notification jobs so they don't block the main worker loop.
+- **Queue access control** — The Notification Service IAM role should have `SendMessage` only on the email queue. The Email Worker role should have `ReceiveMessage`, `DeleteMessage`, and `GetQueueAttributes` only. No other principal should be able to publish to the queue.
 - **Failure isolation** — Email failures shouldn't affect realtime delivery, and retries shouldn't modify already-closed batches.
 - **Scalability path** — Start with aggregation inside the API, then scale finalization and notifications independently as background load increases.
 - **Time-based correctness** — Watch cancellation and firing must be idempotent and mutually exclusive so late view events cannot fire duplicate notifications.
