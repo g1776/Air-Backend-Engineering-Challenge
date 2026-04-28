@@ -172,32 +172,10 @@ class ES,PS,BS,WS2 stateStyle
 class WS,EMAILQ,EMAILW,EMAIL delivStyle
 ```
 
-## State Topology Recommendation
-
-The state domains are separated conceptually because they have different lifecycles and access patterns. They do not need to be physically separate on day one.
-
-Recommended starting point:
-
-- Use one PostgreSQL cluster.
-- Implement separate tables for event, preference, batch, watch, and finalized notification state.
-- Keep ownership boundaries in code (services and repositories), not in separate databases.
-
-When to split state physically:
-
-- Move `notification_batches` to DynamoDB first if write rate and contention on open batches become the bottleneck.
-- Optionally move `notification_watches` to DynamoDB if deadline scans and cancellation lookups outgrow PostgreSQL.
-- Keep `notification_events`, `notification_preferences`, and `notifications` in PostgreSQL unless there is a strong operational reason to split.
+> [!NOTE]
+> The state domains are separated conceptually because they have different lifecycles and access patterns. They could be one PostgreSQL database (see [Data Model](DATA_MODEL.md)).
 
 ## Implementation in AWS
-
-The AWS mapping below is opinionated for clarity. The default profile favors operational simplicity, and the scale profile shows when to introduce additional managed services.
-
-### Recommended Profiles
-
-| Profile  | Use When                                                                     | State Strategy                                                                                                        |
-| -------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Default  | Early to mid scale, moderate throughput, small team                          | Single PostgreSQL deployment for all notification tables                                                              |
-| Scale-Up | High event throughput, hot aggregation keys, or strict p95/p99 latency goals | Keep PostgreSQL for events/preferences/final notifications, move batch state to DynamoDB, optionally move watch state |
 
 ### Client Layer
 
@@ -223,16 +201,13 @@ The AWS mapping below is opinionated for clarity. The default profile favors ope
 
 ### State Layer
 
-| Logical Store      | Default Recommendation | Scale Recommendation                        | Why                                                                          |
-| ------------------ | ---------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
-| Event Store        | PostgreSQL             | Keep in PostgreSQL                          | Append-only audit stream, straightforward indexing and retention management  |
-| Preference Store   | PostgreSQL             | Keep in PostgreSQL + cache hot reads        | Simple relational overrides/defaults model                                   |
-| Batch Store        | PostgreSQL             | Move to DynamoDB first                      | Hottest mutable path, benefits from conditional writes and partition scaling |
-| Watch Store        | PostgreSQL             | PostgreSQL or DynamoDB based on scan volume | Deadline scans and cancellation lookups can work in either store             |
-| Notification Store | PostgreSQL             | Keep in PostgreSQL                          | Durable user-facing record and auditability                                  |
-
-> [!NOTE]
-> DynamoDB is not mandatory for this design. For this architecture, PostgreSQL is the recommended default for simplicity and consistency. Introduce DynamoDB for batch state when measured throughput and contention justify the added operational complexity.
+| Logical Store      | Recommendation | Why                                                                         |
+| ------------------ | -------------- | --------------------------------------------------------------------------- |
+| Event Store        | PostgreSQL     | Append-only audit stream, straightforward indexing and retention management |
+| Preference Store   | PostgreSQL     | Simple relational overrides/defaults model                                  |
+| Batch Store        | PostgreSQL     | Hottest mutable path; use `ON CONFLICT DO UPDATE` for atomic increments     |
+| Watch Store        | PostgreSQL     | Deadline scans and cancellation lookups fit naturally in SQL                |
+| Notification Store | PostgreSQL     | Durable user-facing record and auditability                                 |
 
 ### Delivery Layer
 
@@ -314,8 +289,6 @@ Redis PUBLISH notifications:{recipient_id}
 Only the task holding the client's socket delivers the push; the others receive and discard. This keeps the API stateless from the load balancer's perspective while allowing any backend component to trigger a real-time push.
 
 For the AWS deployment, use ElastiCache for Redis (single-shard, cluster mode disabled) as the pub/sub broker. ALB sticky sessions are optional — they reduce no-op publishes but aren't required for correctness. Clients should fall back to polling `/notifications/summary` on reconnect to recover any missed pushes.
-
-If the real-time requirement becomes strict (e.g., guaranteed at-most-once delivery with receipts), replace the WebSocket tier with API Gateway WebSocket + DynamoDB connection registry, which is fully decoupled from the API's compute layer.
 
 **WebSocket authentication:**
 
