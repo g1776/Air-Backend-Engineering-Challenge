@@ -1,53 +1,20 @@
-"# Air-Backend-Engineering-Challenge"
+# Air-Backend-Engineering-Challenge
 
-## Core Design Decision for batching notifications
+This design models notification batching as a **mutable, time-extended window** keyed by `(user_id, event_type, group_id)`. Incoming events are ingested synchronously, aggregated into an open batch when possible, and finalized asynchronously once the batching window expires.
 
-For this notification system, I would model notification batching as a mutable, time-extended window keyed by (user_id, event_type, group_id) where each event either updates an existing open batch or creates a new one, and batch closure is handled asynchronously.
+> [!IMPORTANT]
+> The core design objective is to keep the write path simple and cheap while still producing user-friendly summary notifications. The system does that by maintaining at most one open batch per key, extending the window on new activity, and moving finalization and delivery to asynchronous workers.
 
-## Event-Driven Architecture
+## Design Principles
 
-```mermaid
-sequenceDiagram
-participant U as User
-participant API as Backend API
-participant DB as Database
-participant B as Batcher Logic
-participant W as Background Worker
-participant N as Notification Service
-participant WS as Web Client (WS/SSE)
-participant Q as Email Queue
-participant E as Email Worker
+- **Single open batch per key** — avoids broad locking and keeps state management localized
+- **Sliding aggregation window** — extends `window_end` as new events arrive, so bursts collapse into a single notification
+- **Asynchronous finalization** — removes delivery work from the hot path and improves API responsiveness
+- **Low-contention writes** — event processing updates only the relevant batch state for the current key
+- **Channel decoupling** — realtime and email delivery are fanout concerns, not part of ingestion-time logic
 
-    %% --- Event Ingestion ---
-    U->>API: Trigger event (e.g., create asset)
-    API->>DB: Insert into notification_events
+## Sections
 
-    %% --- Batch Aggregation ---
-    API->>B: Process event for batching
-    B->>DB: Lookup open batch (by batch_key)
-
-    alt Open batch exists and active
-        B->>DB: Increment count + extend window_end
-    else No open batch
-        B->>DB: Create new batch (window_end = now + 2 min)
-    end
-
-    %% --- Batch Finalization ---
-    loop Every ~30s
-        W->>DB: Query batches where window_end <= now AND status = open
-        DB-->>W: Return expired batches
-        W->>DB: Mark batch as closed
-        W->>N: Send batch for notification generation
-    end
-
-    %% --- Notification Generation ---
-    N->>N: Construct notification payload
-
-    %% --- Fanout ---
-    N->>WS: Push in-app notification
-    N->>Q: Enqueue email job
-
-    %% --- Email Delivery ---
-    E->>Q: Consume job
-    E->>E: Send email via provider
-```
+- [Event Flow and Architecture](EVENT_FLOW_AND_ARCHITECTURE.md)
+- [Data Model](DATA_MODEL.md)
+- [API Design](API_DESIGN.md)
