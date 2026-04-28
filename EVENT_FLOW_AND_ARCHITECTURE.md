@@ -178,7 +178,7 @@ The state domains are separated conceptually because they have different lifecyc
 
 Recommended starting point:
 
-- Use one PostgreSQL cluster.[^pg]
+- Use one PostgreSQL cluster.
 - Implement separate tables for event, preference, batch, watch, and finalized notification state.
 - Keep ownership boundaries in code (services and repositories), not in separate databases.
 
@@ -245,23 +245,85 @@ The AWS mapping below is opinionated for clarity. The default profile favors ope
 
 ### Cross-Cutting AWS Services
 
-| Concern                      | Recommended Service                     | Notes                                                                 |
-| ---------------------------- | --------------------------------------- | --------------------------------------------------------------------- |
-| Secrets                      | AWS Secrets Manager                     | Store DB credentials and provider API keys                            |
-| Encryption                   | AWS KMS                                 | Encrypt data at rest and key-managed secrets                          |
-| Observability                | CloudWatch + X-Ray + structured logs    | Track worker lag, queue depth, fanout errors, and latency percentiles |
-| Tracing and metrics shipping | AWS Distro for OpenTelemetry            | Optional for standardized traces/metrics exports                      |
-| DLQ handling                 | SQS dead-letter queues                  | Isolate poison notification jobs                                      |
-| Failover and backups         | RDS/Aurora automated backups + Multi-AZ | Recovery posture for primary state store                              |
-
-[^pg]: In AWS, PostgreSQL typically means Amazon RDS for PostgreSQL or Aurora PostgreSQL.
+| Concern                      | Recommended Service                     | Notes                                                                                                                                                                                              |
+| ---------------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Secrets                      | AWS Secrets Manager                     | Store DB credentials and provider API keys; enable automatic rotation                                                                                                                              |
+| Encryption                   | AWS KMS                                 | Encrypt data at rest and key-managed secrets                                                                                                                                                       |
+| Observability                | CloudWatch + X-Ray + structured logs    | Track worker lag, queue depth, fanout errors, and latency percentiles                                                                                                                              |
+| Tracing and metrics shipping | AWS Distro for OpenTelemetry            | Optional for standardized traces/metrics exports                                                                                                                                                   |
+| DLQ handling                 | SQS dead-letter queues                  | Isolate poison notification jobs                                                                                                                                                                   |
+| Failover and backups         | RDS/Aurora automated backups + Multi-AZ | Recovery posture for primary state store                                                                                                                                                           |
+| Queue access control         | SQS resource-based IAM policies         | Notification Service IAM role: `SendMessage` only. Email Worker IAM role: `ReceiveMessage` + `DeleteMessage` + `GetQueueAttributes` only. No other principal may publish to the notification queue |
 
 ## Operational Considerations
 
-- **Idempotency** — All batch updates and workers should safely retry since schedulers, queues, and restarts will fail occasionally.
 - **Observability** — Track key metrics like batch count, batch age, worker lag, queue depth, delivery failures, and notification volume.
 - **Failure isolation** — Email failures shouldn't affect realtime delivery, and retries shouldn't modify already-closed batches.
 - **Scalability path** — Start with aggregation inside the API, then scale finalization and notifications independently as background load increases.
-- **Data model choice** — Use PostgreSQL as the default store for all state domains, and move batch state to DynamoDB only when measured contention or throughput requires it.
-- **Time-based correctness** — Ensure watch cancellation and firing are idempotent and mutually exclusive, so late view events cannot fire duplicate notifications.
-- **Preference correctness** — Record events regardless of preference; enforce preferences at channel eligibility and again before final notification insert and fanout.
+- **Time-based correctness** — Watch cancellation and firing must be idempotent and mutually exclusive so late view events cannot fire duplicate notifications.
+
+## Worker Concurrency
+
+The batch finalization worker runs on a schedule and must be safe to run as multiple concurrent instances — for example, multiple ECS tasks or Lambda invocations triggered at the same time by EventBridge.
+
+**Problem:** Without coordination, two worker instances could both claim the same expired batch, close it twice, and generate duplicate notifications.
+
+**Solution: `SELECT ... FOR UPDATE SKIP LOCKED`**
+
+Each worker instance claims a bounded set of expired rows in a single atomic statement:
+
+```sql
+SELECT id FROM notification_batches
+WHERE window_end <= now()
+  AND status = 'open'
+ORDER BY window_end
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+```
+
+`SKIP LOCKED` causes each worker to bypass rows that another worker has already locked, so two concurrent instances process disjoint sets of batches with no coordination overhead and no blocking. The same pattern applies to the expired-watch scan, substituting `notification_watches`, `fire_at`, and `status = 'active'`.
+
+After claiming rows, each worker closes or fires them within the same transaction before releasing the locks. Because the status transition (`open → closed`, `active → fired`) is the same transaction as the lock, a crash mid-flight leaves the rows locked only for the duration of the transaction; PostgreSQL releases the lock automatically on rollback, and the next worker run picks them up.
+
+**Additional guards:**
+
+- Check the expected current status in the `WHERE` clause of the `UPDATE` as a backstop against any edge-case double-claim.
+- Notification insert should use `ON CONFLICT DO NOTHING` keyed on `(batch_id, channel)` or `(watch_id, channel)` as a final backstop against duplicate delivery rows.
+
+## Real-Time Channel Scaling
+
+WebSocket connections are stateful and pinned to a specific server instance. When the API runs as multiple ECS tasks behind a load balancer, a push from one task will not reach a client connected to a different task.
+
+**Problem:** The notification service writes a finalized notification and needs to push it to the user's active WebSocket connection — but any of the `n` API tasks could hold that connection.
+
+**Solution: Redis pub/sub fan-out**
+
+Introduce a Redis pub/sub channel per user (e.g., `notifications:{recipient_id}`). Every API task subscribes to its connected users' channels at connection time and unsubscribes on disconnect.
+
+```
+Notification Service
+        │
+        ▼
+Redis PUBLISH notifications:{recipient_id}
+        │
+        ├── API Task 1 (subscribed, no connection for this user) — no-op
+        ├── API Task 2 (subscribed, holds WS connection) — pushes to client ✓
+        └── API Task 3 (subscribed, no connection for this user) — no-op
+```
+
+Only the task holding the client's socket delivers the push; the others receive and discard. This keeps the API stateless from the load balancer's perspective while allowing any backend component to trigger a real-time push.
+
+For the AWS deployment, use ElastiCache for Redis (single-shard, cluster mode disabled) as the pub/sub broker. ALB sticky sessions are optional — they reduce no-op publishes but aren't required for correctness. Clients should fall back to polling `/notifications/summary` on reconnect to recover any missed pushes.
+
+If the real-time requirement becomes strict (e.g., guaranteed at-most-once delivery with receipts), replace the WebSocket tier with API Gateway WebSocket + DynamoDB connection registry, which is fully decoupled from the API's compute layer.
+
+**WebSocket authentication:**
+
+The bearer token used for REST requests must also authenticate the WebSocket connection. Authentication is enforced at the HTTP upgrade handshake, not per-message:
+
+1. Client sends the upgrade request with the bearer token in the `Authorization` header (or as a query parameter for clients that cannot set headers on WebSocket connections — the token must be short-lived and single-use in that case).
+2. The server validates the token before completing the upgrade. If validation fails, the server returns `401` and the connection is not opened.
+3. After the upgrade, the authenticated user identity is bound to the connection for its lifetime. No re-authentication per message is required.
+4. Token expiry during a long-lived connection: the server must close the connection with code `4001` (application-defined) when it detects the bound token has expired. Clients should reconnect with a fresh token.
+
+Note: tokens passed as query parameters appear in server access logs and browser history; prefer the `Authorization` header where the client library allows it.

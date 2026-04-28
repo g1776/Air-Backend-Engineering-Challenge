@@ -7,6 +7,13 @@ This system delivers user notifications from two trigger classes through one pip
 
 The write path stays lightweight: events are recorded synchronously, while finalization and delivery run asynchronously.
 
+## Sections
+
+- [Event Flow and Architecture](EVENT_FLOW_AND_ARCHITECTURE.md)
+- [Data Model](DATA_MODEL.md)
+- [API Design](API_DESIGN.md)
+- [Design Process](DESIGN_PROCESS.md) - this document outlines how I iteratively designed the system for this assignment
+
 ## Core Flow
 
 1. Ingest event and write immutable event log row.
@@ -48,9 +55,3 @@ User disables email for a notification type after events were already batched.
 - Events remain recorded for auditability.
 - Finalization re-checks preferences.
 - Email is suppressed while other enabled channels can still deliver.
-
-## Sections
-
-- [Event Flow and Architecture](EVENT_FLOW_AND_ARCHITECTURE.md)
-- [Data Model](DATA_MODEL.md)
-- [API Design](API_DESIGN.md)

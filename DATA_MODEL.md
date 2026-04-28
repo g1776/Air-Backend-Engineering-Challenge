@@ -81,10 +81,8 @@ flowchart LR
 
 ### Why This Split Exists
 
-- Persisted links provide clean lineage from delivered notifications back to their trigger state
-- Lookup-backed runtime associations keep ingestion fast and avoid over-coupling event rows to mutable state
-- Channel-specific batch rows let the system honor different grouping rules and debounce windows without introducing special cases into finalization
-- Preference resolution can be evaluated both at aggregation time and finalization time without changing event immutability
+- Persisted links provide clean lineage from delivered notifications back to their trigger state.
+- Lookup-backed runtime associations keep ingestion fast and avoid coupling event rows to mutable state.
 
 ---
 
@@ -274,6 +272,45 @@ Example for one `asset_added` event:
 - Prevent duplicate open batches for the same `(recipient_id, channel, notification_type, group_key)`.
 - Prevent duplicate active watches for the same `(recipient_id, notification_type, watched_resource_id)`.
 - Keep notification rows immutable after insertion for reliable auditability.
+
+</details>
+
+<details>
+<summary>Concurrent Batch UPSERT Safety</summary>
+
+Two simultaneous events for the same `(recipient_id, channel, notification_type, group_key)` can race and either create a duplicate open batch or lose an `event_count` increment. The recommended approach is a single atomic statement:
+
+```sql
+INSERT INTO notification_batches (
+    id, recipient_id, notification_type, channel, group_key,
+    -- ... remaining columns ...
+    event_count, window_start, window_end, status, created_at, updated_at
+)
+VALUES (
+    gen_random_uuid(), $1, $2, $3, $4,
+    -- ...
+    1, now(), now() + $debounce_interval, 'open', now(), now()
+)
+ON CONFLICT (recipient_id, channel, notification_type, group_key)
+WHERE status = 'open'
+DO UPDATE SET
+    event_count = notification_batches.event_count + 1,
+    window_end  = GREATEST(notification_batches.window_end, now() + $debounce_interval),
+    updated_at  = now();
+```
+
+Key properties:
+
+- The partial unique index (`WHERE status = 'open'`) is the conflict target, so closed batches don't block new open ones.
+- `event_count + 1` and `GREATEST(window_end, ...)` are applied atomically by the database, preventing lost increments and stale overwrites under concurrent writers.
+
+The partial unique index that drives the conflict target:
+
+```sql
+CREATE UNIQUE INDEX notification_batches_open_batch_uidx
+    ON notification_batches (recipient_id, channel, notification_type, group_key)
+    WHERE status = 'open';
+```
 
 </details>
 

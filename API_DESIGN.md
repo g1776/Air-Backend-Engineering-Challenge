@@ -4,6 +4,10 @@
 > Base path: `/v1`
 >
 > Auth model: bearer token, self-scoped endpoints.
+>
+> All connections must use TLS 1.2 or later. HTTP requests must be rejected or permanently redirected to HTTPS at the load balancer.
+>
+> CORS: the API returns `Access-Control-Allow-Origin` restricted to the application's known origin(s). Wildcard origins (`*`) are not permitted. Preflight requests for mutation endpoints must be handled.
 
 This document specifies the REST contract for:
 
@@ -44,17 +48,17 @@ This document specifies the REST contract for:
 
 ### Notification Object
 
-| Field             | Type              | Notes                                                   |
-| ----------------- | ----------------- | ------------------------------------------------------- |
-| id                | uuid              | Notification ID                                         |
-| recipient_id      | uuid              | Authenticated user ID                                   |
-| channel           | enum              | in_app or email                                         |
-| notification_type | enum              | Canonical notification type                             |
-| event_count       | integer           | Aggregated event count; 0 for watch-fired notifications |
-| is_seen           | boolean           | Feed-view state                                         |
-| read_at           | timestamp \| null | Read timestamp                                          |
-| created_at        | timestamp         | Creation time                                           |
-| payload           | object            | Render-ready message data                               |
+| Field             | Type              | Notes                                                                                                                                                                                              |
+| ----------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| id                | uuid              | Notification ID                                                                                                                                                                                    |
+| recipient_id      | uuid              | Authenticated user ID                                                                                                                                                                              |
+| channel           | enum              | in_app or email                                                                                                                                                                                    |
+| notification_type | enum              | Canonical notification type                                                                                                                                                                        |
+| event_count       | integer           | Aggregated event count; 0 for watch-fired notifications                                                                                                                                            |
+| is_seen           | boolean           | Feed-view state                                                                                                                                                                                    |
+| read_at           | timestamp \| null | Read timestamp                                                                                                                                                                                     |
+| created_at        | timestamp         | Creation time                                                                                                                                                                                      |
+| payload           | object            | Render-ready message data; all string fields must be treated as plain text and HTML-escaped before rendering. The server produces sanitized text — callers must not trust this field as safe HTML. |
 
 ### Summary Object
 
@@ -127,6 +131,7 @@ Response 200:
 - Sort: created_at DESC, id DESC
 - Cursor boundary: (created_at, id)
 - Cursor is opaque and must be treated as a token, not parsed client-side
+- Cursors are HMAC-signed server-side (e.g., HMAC-SHA256 with a rotating secret from AWS Secrets Manager). A cursor that fails signature verification is rejected with `400 INVALID_CURSOR`. This prevents parameter tampering that could otherwise bypass the `recipient_id` boundary or skip arbitrary rows.
 
 </details>
 
@@ -175,6 +180,11 @@ Request:
 }
 ```
 
+Notes:
+
+- `notification_ids` must not be empty and is capped at **100 IDs per request**. Requests exceeding this limit are rejected with `400 VALIDATION_ERROR` before any database access. This prevents large `IN (...)` clauses from being used as a denial-of-service vector.
+- Each ID must be a valid UUID v4; malformed values are rejected at input validation, not at query time.
+
 Response 200:
 
 ```json
@@ -194,6 +204,10 @@ Request:
 	"notification_ids": ["c7276de0-13c4-4f16-91ca-f96304f0565d"]
 }
 ```
+
+Notes:
+
+- Same array size constraint as mark-seen: 1–100 UUIDs per request.
 
 Response 200:
 
@@ -219,7 +233,9 @@ Request:
 
 Notes:
 
-- `channel` and `before` are optional but recommended for bounded updates.
+- `channel` and `before` are optional filters, but the server imposes an internal page size of 1,000 rows per call. If more rows match, the response includes `"has_more": true` and the client must call again.
+- Without `before`, the cutoff defaults to `now()` at request time, preventing unbounded scans against recently created notifications.
+- Without `channel`, the update applies across all channels; callers should prefer supplying `channel` when the intent is channel-specific.
 
 Response 200:
 
@@ -355,15 +371,37 @@ Status codes:
 <details>
 <summary>Authorization and ownership</summary>
 
-- Endpoints are self-scoped to the authenticated user.
-- Notification IDs not owned by caller are rejected or ignored based on security policy.
+All endpoints are self-scoped: the authenticated user's ID is extracted from the bearer token and injected server-side into every query. Clients never pass a `recipient_id` parameter.
+
+Enforcement rules by endpoint:
+
+| Endpoint                                                                     | Enforcement                                                                                                                                                      |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET /notifications, GET /notifications/summary                               | `WHERE recipient_id = $auth_user_id` applied at query layer                                                                                                      |
+| POST /notifications/actions/mark-seen, POST /notifications/actions/mark-read | Server filters `notification_ids` to those owned by the caller before updating; unrecognized IDs are silently excluded (not a 403) to avoid confirming existence |
+| POST /notifications/actions/mark-all-read                                    | Same ownership scope; no caller-supplied recipient parameter accepted                                                                                            |
+| /notification-preferences (all methods)                                      | All reads and writes scoped to `$auth_user_id`; path params validated against allowed enum values before any DB access                                           |
+
+UUID v4 IDs are unpredictable, but the server-side ownership filter is the authoritative guard — not ID unguessability.
 
 </details>
 
 <details>
 <summary>Rate limiting guidance</summary>
 
-- Apply per-user limits to feed polling and bulk actions.
-- Prefer websocket/SSE invalidation hints to reduce polling frequency.
+Limits are enforced per authenticated user at the API gateway or load balancer layer. Exceeding any limit returns `429` with a `Retry-After` header. The values below are illustrative starting points and should be tuned based on observed traffic.
+
+| Endpoint group                      | Limit       |
+| ----------------------------------- | ----------- |
+| GET /notifications                  | 60 req/min  |
+| GET /notifications/summary          | 120 req/min |
+| POST /notifications/actions/\*      | 20 req/min  |
+| GET /notification-preferences       | 60 req/min  |
+| PUT /notification-preferences/\*    | 10 req/min  |
+| DELETE /notification-preferences/\* | 10 req/min  |
+
+Additionally, apply a per-IP limit (e.g., 300 req/min) before authentication is resolved, as a first-line defense against unauthenticated abuse. This limit should be more generous than the per-user limits to avoid impacting legitimate traffic behind shared NAT.
+
+Prefer WebSocket/SSE push to drive badge updates rather than client polling of `/notifications/summary`, which is the most likely polling target.
 
 </details>
